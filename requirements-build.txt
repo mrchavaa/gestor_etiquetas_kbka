@@ -1,0 +1,7 @@
+cx-Freeze==8.6.4
+PyQt6
+Pillow
+reportlab
+pandas
+qrcode[pil]
+pywin32
