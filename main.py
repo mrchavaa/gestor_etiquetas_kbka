@@ -1,6 +1,17 @@
-"""
-KBKA SHOP - Centro de Etiquetas
-Launcher unificado para etiquetas de envío y etiquetas CEDIS/modelos.
+"""KBKA SHOP - Gestor de Etiquetas.
+
+Versión oficial: 2.1.1
+
+Este archivo es el punto de entrada de la aplicación. Sus responsabilidades son:
+
+1. Crear el launcher principal y las tarjetas de acceso a cada módulo.
+2. Mantener sincronizado el tema claro/oscuro mediante QSettings.
+3. Abrir ``envios.py`` y ``modelos.py`` dentro de una ventana integrada.
+4. Aplicar las transiciones de entrada y salida entre el launcher y los módulos.
+5. Mostrar información general del sistema y el estado de la impresora guardada.
+
+La lógica específica para generar etiquetas se encuentra en ``envios.py`` y
+``modelos.py``. Este módulo se concentra en navegación, integración y apariencia.
 """
 
 from __future__ import annotations
@@ -9,8 +20,8 @@ import importlib
 import os
 import sqlite3
 import sys
-from pathlib import Path
 from typing import Optional
+
 
 from PyQt6.QtCore import (
     QEasingCurve,
@@ -38,8 +49,8 @@ from PyQt6.QtWidgets import (
 )
 
 
-APP_VERSION = "2.0.0"
-APP_TITLE = "KBKA SHOP - Centro de Etiquetas"
+APP_VERSION = "2.1.1"
+APP_TITLE = "KBKA SHOP - Gestor de Etiquetas"
 ASSETS_DIR = "assets"
 ICONS_DIR = os.path.join(ASSETS_DIR, "icons")
 HEADERS_DIR = os.path.join(ASSETS_DIR, "headers")
@@ -59,14 +70,14 @@ def obtener_ruta_recurso(ruta_relativa: str) -> str:
     return os.path.join(base_path, ruta_relativa)
 def buscar_icono_asset(nombre_archivo: str) -> str:
     """
-    Busca un icono primero en assets/ y después en assets/icons/.
+    Busca un icono primero en assets/icons/ y después en assets/.
 
     Esto permite utilizar los recursos compartidos del proyecto unificado
     sin exigir que todos estén dentro de la misma subcarpeta.
     """
     candidatos = (
-        os.path.join(ASSETS_DIR, nombre_archivo),
         os.path.join(ICONS_DIR, nombre_archivo),
+        os.path.join(ASSETS_DIR, nombre_archivo),
     )
 
     for ruta_relativa in candidatos:
@@ -120,6 +131,7 @@ def cargar_icono_adaptado_tema(
     ancho: int,
     alto: int,
 ) -> QIcon:
+    """Carga icono adaptado tema y mantiene actualizado el estado relacionado."""
     pixmap = cargar_pixmap_adaptado_tema(
         ruta_icono,
         tema_oscuro,
@@ -174,22 +186,25 @@ def cargar_pixmap_colorizado(
 
 
 def configurar_app_id() -> None:
+    """Configura app id y mantiene actualizado el estado relacionado."""
     try:
         import ctypes
 
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-            "kbkashop.etiquetas.unificado.2.0"
+            "kbkashop.etiquetas.gestor.2.1"
         )
     except Exception:
         pass
 
 
 def obtener_db_path() -> str:
+    """Obtiene db path y mantiene actualizado el estado relacionado."""
     appdata = os.getenv("APPDATA") or os.path.expanduser("~")
     return os.path.join(appdata, "KBKA_Shop", "kbka_data.db")
 
 
 class ModuleCard(QFrame):
+    """Tarjeta interactiva del launcher que representa un módulo disponible."""
     clicked = pyqtSignal()
 
     def __init__(
@@ -202,6 +217,7 @@ class ModuleCard(QFrame):
         fallback_icon: str = "",
         parent: Optional[QWidget] = None,
     ):
+        """Inicializa el objeto, crea su estado interno y prepara sus componentes visuales."""
         super().__init__(parent)
 
         self.icon_filename = icon_filename
@@ -278,6 +294,7 @@ class ModuleCard(QFrame):
         content_layout.addStretch()
 
     def _actualizar_icono(self) -> None:
+        """Actualiza icono y mantiene actualizado el estado relacionado."""
         path = buscar_icono_asset(self.icon_filename)
 
         if self._hovered:
@@ -302,10 +319,12 @@ class ModuleCard(QFrame):
             self.icon_label.setText(self.fallback_icon)
 
     def actualizar_icono_tema(self, tema_oscuro: bool) -> None:
+        """Actualiza icono tema y mantiene actualizado el estado relacionado."""
         self.tema_oscuro = tema_oscuro
         self._actualizar_icono()
 
     def _actualizar_hover(self, hovered: bool) -> None:
+        """Actualiza hover y mantiene actualizado el estado relacionado."""
         self._hovered = hovered
         self.setProperty("hovered", hovered)
         self.style().unpolish(self)
@@ -317,14 +336,17 @@ class ModuleCard(QFrame):
         self._actualizar_icono()
 
     def enterEvent(self, event) -> None:
+        """Actualiza el aspecto del control cuando el puntero entra en su área."""
         self._actualizar_hover(True)
         super().enterEvent(event)
 
     def leaveEvent(self, event) -> None:
+        """Restaura el aspecto del control cuando el puntero sale de su área."""
         self._actualizar_hover(False)
         super().leaveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
+        """Emite la acción del control cuando termina un clic válido del mouse."""
         if event.button() == Qt.MouseButton.LeftButton:
             self.clicked.emit()
         super().mouseReleaseEvent(event)
@@ -333,6 +355,7 @@ class NavegacionModuloMixin:
     """Agrega navegación al inicio a las ventanas originales."""
 
     def __init__(self, launcher, tema_inicial: bool):
+        """Inicializa el objeto, crea su estado interno y prepara sus componentes visuales."""
         self._launcher = launcher
         self._regresando_inicio = False
         super().__init__()
@@ -345,6 +368,8 @@ class NavegacionModuloMixin:
             self.aplicar_estilos()
         if hasattr(self, "actualizar_iconos_footer"):
             self.actualizar_iconos_footer()
+        if hasattr(self, "_actualizar_iconos_formulario"):
+            self._actualizar_iconos_formulario()
         if hasattr(self, "actualizar_header_logo"):
             self.actualizar_header_logo()
         if hasattr(self, "actualizar_vista_previa"):
@@ -412,7 +437,7 @@ class NavegacionModuloMixin:
             Qt.CursorShape.PointingHandCursor
         )
         self.btn_volver_inicio.setToolTip(
-            "Regresar al Centro de Etiquetas"
+            "Regresar al Gestor de Etiquetas"
         )
         self.btn_volver_inicio.clicked.connect(self.volver_al_inicio)
 
@@ -442,23 +467,60 @@ class NavegacionModuloMixin:
 
 
     def alternar_tema(self) -> None:
+        """Alterna tema y mantiene actualizado el estado relacionado."""
         super().alternar_tema()
+
+        # Mantener sincronizado el launcher oculto sin cambiar la paleta
+        # particular que cada módulo usa para sus iconos.
+        self._launcher.tema_oscuro = bool(self.tema_oscuro)
+        self._launcher.settings.setValue("tema_oscuro", self.tema_oscuro)
+        self._launcher.settings.sync()
+
         self._actualizar_icono_tema_modulo()
         self._actualizar_icono_inicio()
 
     def volver_al_inicio(self) -> None:
+        """Regresa al launcher con una transición suave de salida."""
+        if self._regresando_inicio:
+            return
+
         self._regresando_inicio = True
+        if hasattr(self, "btn_volver_inicio"):
+            self.btn_volver_inicio.setEnabled(False)
+
+        # Desvanecer primero el módulo para evitar un cierre brusco.
+        self._animacion_salida = QPropertyAnimation(
+            self,
+            b"windowOpacity",
+            self,
+        )
+        self._animacion_salida.setDuration(320)
+        self._animacion_salida.setStartValue(self.windowOpacity())
+        self._animacion_salida.setEndValue(0.0)
+        self._animacion_salida.setEasingCurve(
+            QEasingCurve.Type.InCubic
+        )
+        self._animacion_salida.finished.connect(
+            self._finalizar_regreso_inicio
+        )
+        self._animacion_salida.start()
+
+    def _finalizar_regreso_inicio(self) -> None:
+        """Muestra el launcher después de completar el fade-out."""
         self._launcher.regresar_desde_modulo(self.tema_oscuro)
         self.close()
 
     def closeEvent(self, event) -> None:
+        """Gestiona el cierre de la ventana y libera o sincroniza el estado correspondiente."""
         if not self._regresando_inicio:
             self._launcher.regresar_desde_modulo(self.tema_oscuro)
         event.accept()
 
 
 class LauncherWindow(QMainWindow):
+    """Ventana principal que coordina navegación, tema global y acceso a módulos."""
     def __init__(self):
+        """Inicializa el objeto, crea su estado interno y prepara sus componentes visuales."""
         super().__init__()
 
         self.settings = QSettings("KBKA SHOP", "Etiquetas Unificado")
@@ -494,12 +556,14 @@ class LauncherWindow(QMainWindow):
         )
 
     def _leer_tema(self) -> bool:
+        """Ejecuta la lógica asociada a leer tema."""
         value = self.settings.value("tema_oscuro", True)
         if isinstance(value, bool):
             return value
         return str(value).lower() not in {"false", "0", "no"}
 
     def _crear_interfaz(self) -> None:
+        """Crea y configura interfaz y mantiene actualizado el estado relacionado."""
         central = QWidget()
         central.setObjectName("launcher_root")
         self.setCentralWidget(central)
@@ -572,7 +636,7 @@ class LauncherWindow(QMainWindow):
                 "• Etiquetas individuales\n"
                 "• Etiquetas con varios modelos\n"
                 "• Marca, modelo y calidad\n"
-                "• Generación y tipo de marco\n"
+                "• Generación y marco\n"
                 "• Organización de producto\n"
                 "• Control de inventario"
             ),
@@ -685,6 +749,7 @@ class LauncherWindow(QMainWindow):
 
         self._actualizar_icono_impresora()
     def _cargar_logo(self) -> None:
+        """Carga logo y mantiene actualizado el estado relacionado."""
         filename = (
             "header_fondo_oscuro.png"
             if self.tema_oscuro
@@ -736,6 +801,7 @@ class LauncherWindow(QMainWindow):
         self.btn_tema.setIcon(QIcon(icono_tema_pixmap))
 
     def _aplicar_tema(self) -> None:
+        """Aplica tema y mantiene actualizado el estado relacionado."""
         if self.tema_oscuro:
             bg = "#1E1E1F"
             header_bg = "#1E1E1F"
@@ -747,6 +813,10 @@ class LauncherWindow(QMainWindow):
             footer_bg = "#19191A"
             button_bg = "#303033"
             button_hover = "#39393D"
+            icon_button_hover_bg = "#CD0403"
+            icon_button_hover_color = "#FFFFFF"
+            icon_button_hover_border = "none"
+            icon_button_pressed_bg = "#A30302"
         else:
             bg = "#F3F5F7"
             header_bg = "#FFFFFF"
@@ -758,6 +828,10 @@ class LauncherWindow(QMainWindow):
             footer_bg = "#FFFFFF"
             button_bg = "#F0F2F5"
             button_hover = "#E7EAEE"
+            icon_button_hover_bg = "#F2D2D2"
+            icon_button_hover_color = "#2B2B2B"
+            icon_button_hover_border = "1px solid #D98A8A"
+            icon_button_pressed_bg = "#E7BDBD"
 
         self._actualizar_icono_tema_launcher()
 
@@ -835,15 +909,15 @@ class LauncherWindow(QMainWindow):
             }}
 
             QPushButton#launcher_info_button:hover {{
-                background-color: #CD0403;
-                color: #FFFFFF;
-                border: none;
+                background-color: {icon_button_hover_bg};
+                color: {icon_button_hover_color};
+                border: {icon_button_hover_border};
             }}
 
             QPushButton#launcher_info_button:pressed {{
-                background-color: #A30302;
-                color: #FFFFFF;
-                border: none;
+                background-color: {icon_button_pressed_bg};
+                color: {icon_button_hover_color};
+                border: {icon_button_hover_border};
             }}
 
             QPushButton#launcher_theme_button {{
@@ -855,15 +929,15 @@ class LauncherWindow(QMainWindow):
             }}
 
             QPushButton#launcher_theme_button:hover {{
-                background-color: #CD0403;
-                color: #FFFFFF;
-                border: none;
+                background-color: {icon_button_hover_bg};
+                color: {icon_button_hover_color};
+                border: {icon_button_hover_border};
             }}
 
             QPushButton#launcher_theme_button:pressed {{
-                background-color: #A30302;
-                color: #FFFFFF;
-                border: none;
+                background-color: {icon_button_pressed_bg};
+                color: {icon_button_hover_color};
+                border: {icon_button_hover_border};
             }}
 
             QFrame#launcher_footer_bar {{
@@ -912,6 +986,7 @@ class LauncherWindow(QMainWindow):
             self.card_modelos.actualizar_icono_tema(self.tema_oscuro)
     def _actualizar_badges(self) -> None:
         # Se conserva el último módulo en configuración, pero ya no se muestra.
+        """Actualiza badges y mantiene actualizado el estado relacionado."""
         return
 
     def _actualizar_icono_impresora(self) -> None:
@@ -929,6 +1004,7 @@ class LauncherWindow(QMainWindow):
         self.printer_icon_label.setPixmap(pixmap)
 
     def _actualizar_impresora(self) -> None:
+        """Actualiza impresora y mantiene actualizado el estado relacionado."""
         printer = None
         db_path = obtener_db_path()
 
@@ -964,7 +1040,7 @@ class LauncherWindow(QMainWindow):
         """Muestra la información del sistema mediante KBKADialog."""
         mensaje = (
             "KBKA SHOP\n"
-            f"Centro de Etiquetas v{APP_VERSION}\n\n"
+            f"Gestor de Etiquetas v{APP_VERSION}\n\n"
             "Sistema para la generación e impresión de etiquetas "
             "de envío y etiquetas de modelos para la operación "
             "de KBKA SHOP.\n\n"
@@ -987,8 +1063,10 @@ class LauncherWindow(QMainWindow):
             mensaje,
         )
     def alternar_tema(self) -> None:
+        """Alterna tema y mantiene actualizado el estado relacionado."""
         self.tema_oscuro = not self.tema_oscuro
         self.settings.setValue("tema_oscuro", self.tema_oscuro)
+        self.settings.sync()
         self._aplicar_tema()
 
     def abrir_modulo(
@@ -997,6 +1075,7 @@ class LauncherWindow(QMainWindow):
         class_name: str,
         key: str,
     ) -> None:
+        """Abre modulo y mantiene actualizado el estado relacionado."""
         self.settings.setValue("ultimo_modulo", key)
         self._actualizar_badges()
 
@@ -1009,6 +1088,7 @@ class LauncherWindow(QMainWindow):
                 NavegacionModuloMixin,
                 base_class,
             ):
+                """Contenedor que adapta un módulo para funcionar dentro del launcher."""
                 pass
 
             self.hide()
@@ -1040,18 +1120,24 @@ class LauncherWindow(QMainWindow):
             )
 
     def regresar_desde_modulo(self, tema_oscuro: bool) -> None:
+        """Ejecuta la lógica asociada a regresar desde modulo."""
         self.tema_oscuro = bool(tema_oscuro)
         self.settings.setValue("tema_oscuro", self.tema_oscuro)
+        self.settings.sync()
         self.modulo_actual = None
         self._aplicar_tema()
         self._actualizar_impresora()
+
+        # Preparar el launcher invisible antes de mostrarlo. Su showEvent
+        # ejecutará el fade-in existente de 380 ms.
+        self.fade_animation.stop()
+        self.setWindowOpacity(0.0)
         self.showMaximized()
         self.raise_()
         self.activateWindow()
-        self.fade_animation.stop()
-        self.setWindowOpacity(1.0)
 
     def centrar_en_pantalla(self) -> None:
+        """Centra en pantalla y mantiene actualizado el estado relacionado."""
         screen = QApplication.primaryScreen()
         if not screen:
             return
@@ -1061,6 +1147,7 @@ class LauncherWindow(QMainWindow):
         self.move(frame.topLeft())
 
     def showEvent(self, event) -> None:
+        """Responde a la aparición del widget y ejecuta las acciones visuales necesarias."""
         super().showEvent(event)
         self._actualizar_impresora()
 
@@ -1070,10 +1157,11 @@ class LauncherWindow(QMainWindow):
 
 
 def main() -> None:
+    """Inicia QApplication, crea la ventana principal y ejecuta el ciclo de eventos de Qt."""
     configurar_app_id()
 
     app = QApplication(sys.argv)
-    app.setApplicationName("KBKA SHOP - Centro de Etiquetas")
+    app.setApplicationName("KBKA SHOP - Gestor de Etiquetas")
     app.setOrganizationName("KBKA SHOP")
 
     window = LauncherWindow()

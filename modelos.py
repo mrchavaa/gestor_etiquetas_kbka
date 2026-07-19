@@ -1,8 +1,19 @@
-"""
-KBKA SHOP - Sistema de Generación de Etiquetas CEDIS
-Versión: 1.0.0 (PyQt6)
-Fecha: 2026
-author: Chava R.
+"""KBKA SHOP - Generador de Etiquetas de Modelos/CEDIS.
+
+Versión oficial: 2.1.1
+Autor: Ángel Alexander Ramírez Navarro (Chava)
+
+Este módulo administra las etiquetas cuadradas para modelos y CEDIS:
+
+- Etiqueta individual y etiqueta con lista ordenable de modelos.
+- Selección editable de marca, calidad, generación y tipo de marco.
+- Autocompletado dinámico de marcas y calidades.
+- Vista previa, exportación PDF e impresión térmica con QtPrintSupport.
+- Configuración persistente de impresora y tema visual.
+- Diálogos KBKA, ayuda, confirmaciones e información del software.
+
+Los recursos se leen desde ``assets`` y la configuración compartida se conserva
+en AppData/QSettings para mantener consistencia con el launcher y envíos.
 """
 
 from PyQt6.QtWidgets import (
@@ -34,8 +45,8 @@ from PyQt6.QtWidgets import (
 	QVBoxLayout,
 	QWidget,
 )
-from PyQt6.QtCore import Qt, QSize, QStringListModel, QPropertyAnimation, QEasingCurve, QTimer
-from PyQt6.QtGui import QPixmap, QImage, QIcon, QColor, QFont, QFontMetrics
+from PyQt6.QtCore import Qt, QSize, QSizeF, QMarginsF, QRect, QStringListModel, QPropertyAnimation, QEasingCurve, QTimer, QSettings
+from PyQt6.QtGui import QPixmap, QImage, QIcon, QColor, QFont, QFontMetrics, QPainter, QPageSize, QPageLayout
 import os
 import re
 import sys
@@ -53,31 +64,114 @@ import io
 import pandas as pd
 import sqlite3
 
-# ==================== IMPORTACIONES DE PYWIN32 ====================
-WIN32_AVAILABLE = False
-win32print = None
-win32ui = None
-win32api = None
-ImageWin = None
+# Versión pública mostrada en los diálogos de información.
+APP_VERSION = "2.1.1"
+
+# ==================== IMPRESIÓN CON QT PRINT SUPPORT ====================
+# QtPrintSupport usa el sistema nativo de impresión de Windows y evita la
+# dependencia de win32ui/pywin32 y sus DLL MFC.
+QT_PRINT_AVAILABLE = False
+QT_PRINT_ERROR = ""
+QT_PRINT_DIAGNOSTIC_PATH = ""
+QPrinter = None
+QPrinterInfo = None
+
+
+def guardar_diagnostico_impresion(etapa, detalle):
+	"""Guarda errores de QtPrintSupport en AppData para facilitar el diagnóstico."""
+	global QT_PRINT_DIAGNOSTIC_PATH
+
+	try:
+		appdata = os.getenv("APPDATA") or os.path.expanduser("~")
+		carpeta = os.path.join(appdata, "KBKA_Shop")
+		os.makedirs(carpeta, exist_ok=True)
+		ruta = os.path.join(carpeta, "diagnostico_impresion_modelos.txt")
+
+		with open(ruta, "w", encoding="utf-8") as archivo:
+			archivo.write("DIAGNÓSTICO DE IMPRESIÓN QT - MODELOS\n")
+			archivo.write("=======================================\n\n")
+			archivo.write(f"Etapa: {etapa}\n\n")
+			archivo.write(detalle)
+
+		QT_PRINT_DIAGNOSTIC_PATH = ruta
+		return ruta
+	except Exception:
+		return ""
+
+
+def pil_a_qimage(imagen):
+	"""Convierte una imagen PIL en una QImage independiente de su búfer original."""
+	if imagen.mode != "RGB":
+		imagen = imagen.convert("RGB")
+
+	datos = imagen.tobytes("raw", "RGB")
+	bytes_por_linea = imagen.width * 3
+	return QImage(
+		datos,
+		imagen.width,
+		imagen.height,
+		bytes_por_linea,
+		QImage.Format.Format_RGB888,
+	).copy()
+
+
+def crear_impresora_qt(nombre_impresora, ancho_mm, alto_mm, nombre_formato):
+	"""Crea y configura un QPrinter cuadrado con tamaño personalizado."""
+	if not QT_PRINT_AVAILABLE:
+		raise RuntimeError("Qt PrintSupport no está disponible.")
+
+	nombres = [str(nombre) for nombre in QPrinterInfo.availablePrinterNames()]
+	if nombre_impresora not in nombres:
+		raise RuntimeError(
+			f"La impresora '{nombre_impresora}' ya no está disponible en Windows."
+		)
+
+	printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+	printer.setPrinterName(nombre_impresora)
+	printer.setDocName("Etiquetas CEDIS")
+	printer.setFullPage(True)
+
+	tamano_pagina = QPageSize(
+		QSizeF(ancho_mm, alto_mm),
+		QPageSize.Unit.Millimeter,
+		nombre_formato,
+		QPageSize.SizeMatchPolicy.ExactMatch,
+	)
+	orientacion = QPageLayout.Orientation.Portrait
+	layout = QPageLayout(
+		tamano_pagina,
+		orientacion,
+		QMarginsF(0, 0, 0, 0),
+		QPageLayout.Unit.Millimeter,
+	)
+	layout.setMode(QPageLayout.Mode.FullPageMode)
+
+	if not printer.setPageLayout(layout):
+		printer.setPageSize(tamano_pagina)
+		printer.setPageOrientation(orientacion)
+	printer.setFullPage(True)
+
+	if not printer.isValid():
+		raise RuntimeError(
+			f"Windows no pudo inicializar la impresora '{nombre_impresora}'."
+		)
+
+	return printer
+
 
 try:
-	import pythoncom
+	from PyQt6.QtPrintSupport import QPrinter, QPrinterInfo
 
-	pythoncom.CoInitialize()
-	import win32print
-	import win32ui
-	import win32api
-	from PIL import ImageWin
+	QT_PRINT_AVAILABLE = True
+	print("Qt PrintSupport cargado correctamente.")
+except Exception:
+	import traceback
 
-	WIN32_AVAILABLE = True
-	print("Módulos de impresión cargados correctamente (win32print, win32ui, win32api)")
-except ImportError as e:
-	WIN32_AVAILABLE = False
-	print("Advertencia: win32print no disponible. Impresión directa deshabilitada.")
-	print(f"Detalles del error: {e}")
-except Exception as e:
-	WIN32_AVAILABLE = False
-	print(f"Error al cargar módulos de impresión: {e}")
+	QT_PRINT_AVAILABLE = False
+	QT_PRINT_ERROR = traceback.format_exc()
+	guardar_diagnostico_impresion("Carga de Qt PrintSupport", QT_PRINT_ERROR)
+	print("Error al cargar Qt PrintSupport:")
+	print(QT_PRINT_ERROR)
 
 # ==================== PATH CONFIGURATION ====================
 ICONS_DIR = os.path.join("assets", "icons")
@@ -130,6 +224,52 @@ def obtener_ruta_recurso(ruta_relativa):
 		base_path = os.path.dirname(os.path.abspath(__file__))
 
 	return os.path.join(base_path, ruta_relativa)
+
+
+def buscar_icono_asset(nombre_archivo):
+	"""Busca un icono en assets/icons y conserva assets como respaldo."""
+	candidatos = (
+		os.path.join(ICONS_DIR, nombre_archivo),
+		os.path.join("assets", nombre_archivo),
+	)
+	for ruta_relativa in candidatos:
+		ruta = obtener_ruta_recurso(ruta_relativa)
+		if os.path.exists(ruta):
+			return ruta
+	return obtener_ruta_recurso(candidatos[0])
+
+
+# ==================== TEMA GLOBAL COMPARTIDO ====================
+THEME_SETTINGS_ORG = "KBKA SHOP"
+THEME_SETTINGS_APP = "Etiquetas Unificado"
+THEME_SETTINGS_KEY = "tema_oscuro"
+
+
+def leer_tema_global(settings=None):
+	"""Lee el tema compartido sin alterar la paleta propia de cada módulo."""
+	settings = settings or QSettings(THEME_SETTINGS_ORG, THEME_SETTINGS_APP)
+	value = settings.value(THEME_SETTINGS_KEY, True)
+	if isinstance(value, bool):
+		return value
+	return str(value).strip().lower() not in {"false", "0", "no", "off"}
+
+
+def guardar_tema_global(tema_oscuro, settings=None):
+	"""Guarda el modo activo para launcher, Envíos y Modelos."""
+	settings = settings or QSettings(THEME_SETTINGS_ORG, THEME_SETTINGS_APP)
+	settings.setValue(THEME_SETTINGS_KEY, bool(tema_oscuro))
+	settings.sync()
+
+
+class ComboBoxSinRueda(QComboBox):
+	"""Evita cambios accidentales de opción al desplazar el formulario."""
+
+	def wheelEvent(self, event):
+		# La rueda sigue desplazando el contenedor padre y no cambia la selección.
+		"""Ignora la rueda sobre el combo para evitar cambios accidentales y permite el scroll del formulario."""
+		event.ignore()
+
+
 # ==================== CONFIGURACIÓN DE BASE DE DATOS ====================
 appdata_dir = os.getenv("APPDATA") or os.path.expanduser("~")
 kbka_shop_dir = os.path.join(appdata_dir, "KBKA_Shop")
@@ -156,6 +296,7 @@ class KBKADialog(QDialog):
 	"""
 
 	def __init__(self, parent=None, title="", message="", dialog_type="info", buttons=None):
+		"""Inicializa el objeto, crea su estado interno y prepara sus componentes visuales."""
 		super().__init__(parent)
 
 		self.result_value = False
@@ -178,13 +319,17 @@ class KBKADialog(QDialog):
 		self.fade_in_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
 
 	def _setup_ui(self, title, message, buttons):
+		"""Ejecuta la lógica asociada a setup ui."""
 		main_layout = QVBoxLayout(self)
 		main_layout.setContentsMargins(0, 0, 0, 0)
 
 		container = QFrame()
 		container.setObjectName("dialog_container")
 
-		if hasattr(self._parent, "tema_oscuro") and self._parent.tema_oscuro:
+		tema_oscuro_dialogo = bool(
+			hasattr(self._parent, "tema_oscuro") and self._parent.tema_oscuro
+		)
+		if tema_oscuro_dialogo:
 			bg_color = "#1E1E1E"
 			border_color = "#3A3A3A"
 			self.setStyleSheet("QDialog { background-color: transparent; }")
@@ -211,13 +356,23 @@ class KBKADialog(QDialog):
 		icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 		icon_path = self._get_icon_path()
 		if icon_path and os.path.exists(icon_path):
-			pixmap = QPixmap(icon_path)
-			pixmap = pixmap.scaled(
-				48,
-				48,
-				Qt.AspectRatioMode.KeepAspectRatio,
-				Qt.TransformationMode.SmoothTransformation,
-			)
+			if self.dialog_type == "question":
+				# Tono neutro coherente con el tema, igual que en Gestión de Clientes.
+				color_pregunta = "#D8DADD" if tema_oscuro_dialogo else "#343A40"
+				pixmap = recolorear_icono_footer(
+					icon_path,
+					color_pregunta,
+					48,
+					48,
+				)
+			else:
+				pixmap = QPixmap(icon_path)
+				pixmap = pixmap.scaled(
+					48,
+					48,
+					Qt.AspectRatioMode.KeepAspectRatio,
+					Qt.TransformationMode.SmoothTransformation,
+				)
 			icon_label.setPixmap(pixmap)
 			icon_label.setStyleSheet("background: transparent; border: none;")
 		else:
@@ -301,6 +456,7 @@ class KBKADialog(QDialog):
 		self.adjustSize()
 
 	def _create_button(self, text, btn_type):
+		"""Ejecuta la lógica asociada a create button."""
 		btn = QPushButton(text)
 		btn.setFixedSize(100, 35)
 		btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -364,6 +520,7 @@ class KBKADialog(QDialog):
 		return btn
 
 	def _get_icon_path(self):
+		"""Devuelve icon path."""
 		icons = {
 			"success": os.path.join(ICONS_DIR, "icon_success.png"),
 			"error": os.path.join(ICONS_DIR, "icon_error.png"),
@@ -375,6 +532,7 @@ class KBKADialog(QDialog):
 		return obtener_ruta_recurso(icon_file)
 
 	def _get_icon_text(self):
+		"""Devuelve icon text."""
 		icons = {
 			"success": "✓",
 			"error": "✗",
@@ -385,49 +543,63 @@ class KBKADialog(QDialog):
 		return icons.get(self.dialog_type, "ℹ")
 
 	def _get_icon_color(self):
+		"""Devuelve icon color."""
+		if self.dialog_type == "question":
+			tema_oscuro = bool(
+				hasattr(self._parent, "tema_oscuro") and self._parent.tema_oscuro
+			)
+			return "#D8DADD" if tema_oscuro else "#343A40"
+
 		colors = {
 			"success": "#00C853",
 			"error": "#CD0403",
 			"warning": "#FF9800",
 			"info": "#2196F3",
-			"question": "#546E7A",
 		}
 		return colors.get(self.dialog_type, "#2196F3")
 
 	def _on_accept(self):
+		"""Marca el diálogo como aceptado y lo cierra con resultado positivo."""
 		self.result_value = True
 		self.accept()
 
 	def _on_reject(self):
+		"""Marca el diálogo como cancelado y lo cierra con resultado negativo."""
 		self.result_value = False
 		self.reject()
 
 	def showEvent(self, event):
+		"""Responde a la aparición del widget y ejecuta las acciones visuales necesarias."""
 		super().showEvent(event)
 		self.fade_in_animation.start()
 
 	@staticmethod
 	def success(parent, title, message):
+		"""Muestra un KBKADialog de operación completada correctamente."""
 		dialog = KBKADialog(parent, title, message, "success", [("Aceptar", "primary")])
 		dialog.exec()
 
 	@staticmethod
 	def error(parent, title, message):
+		"""Muestra un KBKADialog con información de error."""
 		dialog = KBKADialog(parent, title, message, "error", [("Aceptar", "primary")])
 		dialog.exec()
 
 	@staticmethod
 	def warning(parent, title, message):
+		"""Muestra un KBKADialog de advertencia."""
 		dialog = KBKADialog(parent, title, message, "warning", [("Aceptar", "primary")])
 		dialog.exec()
 
 	@staticmethod
 	def info(parent, title, message):
+		"""Muestra un KBKADialog informativo."""
 		dialog = KBKADialog(parent, title, message, "info", [("Aceptar", "primary")])
 		dialog.exec()
 
 	@staticmethod
 	def confirm(parent, title, message):
+		"""Muestra un KBKADialog de confirmación y devuelve la decisión del usuario."""
 		dialog = KBKADialog(
 			parent,
 			title,
@@ -440,6 +612,7 @@ class KBKADialog(QDialog):
 
 
 class CEDISEtiquetasApp(QMainWindow):
+	"""Ventana principal para crear, previsualizar, guardar e imprimir etiquetas de modelos."""
 	COLORS = {
 		"primary": "#D40103",
 		"secondary": "#D10E0E",
@@ -498,6 +671,7 @@ class CEDISEtiquetasApp(QMainWindow):
 	LABEL_TYPE_OPTIONS = ["Etiqueta individual", "Lista de modelos"]
 
 	def __init__(self):
+		"""Inicializa el objeto, crea su estado interno y prepara sus componentes visuales."""
 		super().__init__()
 
 		self._intro_animation_started = False
@@ -514,13 +688,15 @@ class CEDISEtiquetasApp(QMainWindow):
 		except Exception:
 			pass
 
-		self.tema_oscuro = True
+		self._ajustes_tema = QSettings(THEME_SETTINGS_ORG, THEME_SETTINGS_APP)
+		self.tema_oscuro = leer_tema_global(self._ajustes_tema)
 		self.ayuda_dialog = None
 
 		self.init_ui()
 		# La ventana se muestra y maximiza desde el launcher unificado.
 
 	def showEvent(self, event):
+		"""Responde a la aparición del widget y ejecuta las acciones visuales necesarias."""
 		super().showEvent(event)
 		if self._intro_animation_started:
 			return
@@ -536,6 +712,7 @@ class CEDISEtiquetasApp(QMainWindow):
 		self._intro_opacity_animation.start()
 
 	def inicializar_db(self):
+		"""Inicializa db y mantiene actualizado el estado relacionado."""
 		try:
 			os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 			self.db_path = DB_PATH
@@ -571,6 +748,7 @@ class CEDISEtiquetasApp(QMainWindow):
 			print(f"Error al inicializar base de datos: {e}")
 
 	def guardar_impresora_config(self, nombre_impresora):
+		"""Guarda impresora config y mantiene actualizado el estado relacionado."""
 		try:
 			conn = sqlite3.connect(self.db_path)
 			cursor = conn.cursor()
@@ -587,6 +765,7 @@ class CEDISEtiquetasApp(QMainWindow):
 			print(f"Error al guardar impresora: {e}")
 
 	def cargar_impresora_config(self):
+		"""Carga impresora config y mantiene actualizado el estado relacionado."""
 		try:
 			conn = sqlite3.connect(self.db_path)
 			cursor = conn.cursor()
@@ -602,32 +781,27 @@ class CEDISEtiquetasApp(QMainWindow):
 			return None
 
 	def obtener_impresoras(self):
-		"""
-		Obtiene la lista de impresoras disponibles en el sistema.
-		Utiliza win32print para enumerar impresoras locales y de red.
-		Requiere que pywin32 esté instalado.
-
-		:return: Lista de nombres de impresoras disponibles.
-		:rtype: list
-		"""
-		print("WIN32AVAILABLE: ", WIN32_AVAILABLE)
-		if not WIN32_AVAILABLE:
+		"""Obtiene los nombres de impresoras disponibles mediante QtPrintSupport."""
+		if not QT_PRINT_AVAILABLE:
 			return []
+
 		try:
-			impresoras = []
-			# Obtener impresoras locales y de red
-			printers = win32print.EnumPrinters(
-				win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
-			)
-			print("printers raw: ", printers)
-			for printer in printers:
-				impresoras.append(printer[2])  # printer[2] es el nombre de la impresora
-			return impresoras
-		except Exception as e:
-			print(f"Error al obtener impresoras: {e}")
+			return [
+				str(nombre)
+				for nombre in QPrinterInfo.availablePrinterNames()
+				if str(nombre).strip()
+			]
+		except Exception:
+			import traceback
+
+			error = traceback.format_exc()
+			guardar_diagnostico_impresion("Enumeración de impresoras con Qt", error)
+			print("Error al obtener impresoras con QtPrintSupport:")
+			print(error)
 			return []
 
 	def registrar_historial(self, accion, archivo=None):
+		"""Registra historial y mantiene actualizado el estado relacionado."""
 		try:
 			conn = sqlite3.connect(self.db_path)
 			cursor = conn.cursor()
@@ -675,13 +849,14 @@ class CEDISEtiquetasApp(QMainWindow):
 		"""Abre el diálogo con información del software y desarrollador"""
 		mensaje = (
 			"KBKA Shop\n"
-			"Sistema de Gestión de Etiquetas v1.0.0\n\n"
-			"Desarrollado por: Angel Alexander Ramírez Navarro (Chava 😉)\n"
+			f"Sistema de Gestión de Etiquetas v{APP_VERSION}\n\n"
+			"Desarrollado por: Angel Alexander Ramírez Navarro (Chava)\n"
 			"© 2026 Todos los derechos reservados."
 		)
 		KBKADialog.info(self, "Información del Software", mensaje)
 
 	def init_ui(self):
+		"""Ejecuta la lógica asociada a init ui."""
 		central_widget = QWidget()
 		self.setCentralWidget(central_widget)
 
@@ -694,7 +869,14 @@ class CEDISEtiquetasApp(QMainWindow):
 		self.crear_footer(main_layout)
 		self.aplicar_estilos()
 
+		# Los iconos del formulario se registran mientras se construyen los
+		# widgets. Se aplican al final, cuando todos los botones y títulos ya
+		# existen y el tema inicial está completamente configurado.
+		if hasattr(self, "_actualizar_iconos_formulario"):
+			self._actualizar_iconos_formulario()
+
 	def crear_header(self, main_layout):
+		"""Crea y configura header y mantiene actualizado el estado relacionado."""
 		header = QFrame()
 		header.setObjectName("header")
 		header.setFixedHeight(150)
@@ -726,6 +908,7 @@ class CEDISEtiquetasApp(QMainWindow):
 		main_layout.addWidget(header)
 
 	def actualizar_header_logo(self):
+		"""Actualiza header logo y mantiene actualizado el estado relacionado."""
 		if not hasattr(self, "header_logo_label"):
 			return
 		try:
@@ -744,6 +927,7 @@ class CEDISEtiquetasApp(QMainWindow):
 			print(f"No se pudo actualizar el logo del header: {e}")
 
 	def crear_formulario(self, main_layout):
+		"""Crea y configura formulario y mantiene actualizado el estado relacionado."""
 		form_container = QWidget()
 		form_container.setObjectName("main_content_container")
 		form_layout = QHBoxLayout(form_container)
@@ -751,10 +935,89 @@ class CEDISEtiquetasApp(QMainWindow):
 		form_layout.setSpacing(18)
 		form_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-		def agregar_titulo_tarjeta(layout, texto, ancho_linea=190):
+		self._iconos_titulos_formulario = []
+		self._iconos_botones_formulario = []
+
+		def resolver_icono_asset(*nombres):
+			"""Resuelve icono asset y mantiene actualizado el estado relacionado."""
+			for nombre in nombres:
+				ruta = buscar_icono_asset(nombre)
+				if os.path.exists(ruta):
+					return ruta
+			return buscar_icono_asset(nombres[0])
+
+		def actualizar_iconos_formulario():
+			"""Actualiza iconos formulario y mantiene actualizado el estado relacionado."""
+			color_titulo = "#F2F2F2" if self.tema_oscuro else "#343A40"
+			color_tema = "#F2F2F2" if self.tema_oscuro else "#343A40"
+			color_muted = "#BFC3C7" if self.tema_oscuro else "#666666"
+
+			for etiqueta, nombres, tamano in self._iconos_titulos_formulario:
+				ruta = resolver_icono_asset(*nombres)
+				pixmap = recolorear_icono_footer(
+					ruta, color_titulo, tamano, tamano
+				)
+				if pixmap.isNull():
+					etiqueta.clear()
+					continue
+
+				# Añade margen transparente alrededor del PNG para evitar
+				# que iconos anchos, como vista_previa.png, se recorten.
+				margen = 4
+				lienzo = QPixmap(
+					pixmap.width() + (margen * 2),
+					pixmap.height() + (margen * 2),
+				)
+				lienzo.fill(Qt.GlobalColor.transparent)
+				pintor_icono = QPainter(lienzo)
+				pintor_icono.drawPixmap(margen, margen, pixmap)
+				pintor_icono.end()
+				etiqueta.setPixmap(lienzo)
+
+			for boton, nombres, modo, tamano in self._iconos_botones_formulario:
+				ruta = resolver_icono_asset(*nombres)
+				if modo == "primary":
+					color = "#FFFFFF"
+				elif modo == "muted":
+					color = color_muted
+				elif modo == "danger":
+					color = "#FFFFFF" if self.tema_oscuro else "#8E2C2C"
+				else:
+					color = color_tema
+				pixmap = recolorear_icono_footer(ruta, color, tamano, tamano)
+				boton.setIcon(QIcon(pixmap))
+				boton.setIconSize(QSize(tamano, tamano))
+
+		self._actualizar_iconos_formulario = actualizar_iconos_formulario
+
+		def agregar_titulo_tarjeta(
+			layout, texto, ancho_linea=190, iconos_archivo=None
+		):
+			"""Agrega titulo tarjeta y mantiene actualizado el estado relacionado."""
+			fila_titulo = QHBoxLayout()
+			fila_titulo.setContentsMargins(0, 0, 0, 0)
+			fila_titulo.setSpacing(8)
+
+			if iconos_archivo:
+				if isinstance(iconos_archivo, str):
+					iconos_archivo = (iconos_archivo,)
+				icono_label = QLabel()
+				# Espacio adicional para que los iconos no se recorten.
+				icono_label.setFixedSize(32, 32)
+				icono_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+				icono_label.setStyleSheet(
+					"background: transparent; border: none;"
+				)
+				self._iconos_titulos_formulario.append(
+					(icono_label, tuple(iconos_archivo), 22)
+				)
+				fila_titulo.addWidget(icono_label)
+
 			titulo = QLabel(texto)
 			titulo.setObjectName("card_title")
-			layout.addWidget(titulo)
+			fila_titulo.addWidget(titulo)
+			fila_titulo.addStretch()
+			layout.addLayout(fila_titulo)
 
 			linea = QFrame()
 			linea.setObjectName("card_separator")
@@ -763,10 +1026,48 @@ class CEDISEtiquetasApp(QMainWindow):
 			linea.setFixedWidth(ancho_linea)
 			layout.addWidget(linea)
 
-		def crear_etiqueta_campo(texto):
+		def registrar_icono_boton(
+			boton, icono_archivo, modo="theme", tamano=20
+		):
+			# QPushButton no expone una propiedad directa para separar el icono
+			# del texto. Un espacio tipográfico ancho mantiene una separación
+			# uniforme sin depender de la fuente ni de espacios normales.
+			"""Registra icono boton y mantiene actualizado el estado relacionado."""
+			texto_actual = boton.text()
+			if texto_actual and not texto_actual.startswith("\u2003"):
+				boton.setText("\u2003" + texto_actual)
+
+			self._iconos_botones_formulario.append(
+				(boton, (icono_archivo,), modo, tamano)
+			)
+
+		def crear_etiqueta_campo(texto, icono_archivo=None):
+			"""Crea y configura etiqueta campo y mantiene actualizado el estado relacionado."""
 			label = QLabel(texto)
 			label.setObjectName("field_label")
-			return label
+
+			if not icono_archivo:
+				return label
+
+			contenedor = QWidget()
+			contenedor.setObjectName("transparent_widget")
+			fila = QHBoxLayout(contenedor)
+			fila.setContentsMargins(0, 0, 0, 0)
+			fila.setSpacing(5)
+
+			icono_label = QLabel()
+			icono_label.setFixedSize(24, 24)
+			icono_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+			icono_label.setStyleSheet(
+				"background: transparent; border: none;"
+			)
+			self._iconos_titulos_formulario.append(
+				(icono_label, (icono_archivo,), 16)
+			)
+			fila.addWidget(icono_label)
+			fila.addWidget(label)
+			fila.addStretch()
+			return contenedor
 
 		# ==================== PANEL IZQUIERDO ====================
 		left_widget = QWidget()
@@ -785,10 +1086,15 @@ class CEDISEtiquetasApp(QMainWindow):
 		datos_layout.setContentsMargins(20, 18, 20, 18)
 		datos_layout.setSpacing(10)
 
-		agregar_titulo_tarjeta(datos_layout, "📋  DATOS DE LA ETIQUETA", 250)
+		agregar_titulo_tarjeta(
+			datos_layout,
+			"DATOS DE LA ETIQUETA",
+			250,
+			("datos_modelos.png", "datos_modelos"),
+		)
 
 		datos_layout.addWidget(crear_etiqueta_campo("Tipo de etiqueta"))
-		self.combo_tipo_etiqueta = QComboBox()
+		self.combo_tipo_etiqueta = ComboBoxSinRueda()
 		self.combo_tipo_etiqueta.addItems(self.LABEL_TYPE_OPTIONS)
 		self.combo_tipo_etiqueta.setCurrentIndex(0)
 		self.combo_tipo_etiqueta.currentTextChanged.connect(
@@ -808,13 +1114,14 @@ class CEDISEtiquetasApp(QMainWindow):
 		marca_layout.setSpacing(5)
 		marca_layout.addWidget(crear_etiqueta_campo("Marca"))
 
-		self.combo_marca = QComboBox()
+		self.combo_marca = ComboBoxSinRueda()
 		self.combo_marca.setEditable(True)
 		self.combo_marca.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
 		self.combo_marca.addItems(self.BRAND_OPTIONS)
 		self.combo_marca.setCompleter(
 			self._crear_completer(self.BRAND_OPTIONS, self.combo_marca)
 		)
+		self._conectar_autocompletado_dinamico(self.combo_marca)
 		self.combo_marca.setCurrentIndex(0)
 		self.combo_marca.currentTextChanged.connect(self.actualizar_vista_previa)
 		marca_layout.addWidget(self.combo_marca)
@@ -824,7 +1131,7 @@ class CEDISEtiquetasApp(QMainWindow):
 		modelo_layout = QVBoxLayout(self.individual_widget)
 		modelo_layout.setContentsMargins(0, 0, 0, 0)
 		modelo_layout.setSpacing(5)
-		modelo_layout.addWidget(crear_etiqueta_campo("Modelo"))
+		modelo_layout.addWidget(crear_etiqueta_campo("Modelo", "modelo.png"))
 
 		self.entry_modelo = QLineEdit()
 		self.entry_modelo.setPlaceholderText("Ingrese el modelo")
@@ -841,13 +1148,14 @@ class CEDISEtiquetasApp(QMainWindow):
 		individual_options_layout.setSpacing(9)
 
 		individual_options_layout.addWidget(crear_etiqueta_campo("Calidad"))
-		self.combo_calidad = QComboBox()
+		self.combo_calidad = ComboBoxSinRueda()
 		self.combo_calidad.setEditable(True)
 		self.combo_calidad.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
 		self.combo_calidad.addItems(self.QUALITY_OPTIONS)
 		self.combo_calidad.setCompleter(
 			self._crear_completer(self.QUALITY_OPTIONS, self.combo_calidad)
 		)
+		self._conectar_autocompletado_dinamico(self.combo_calidad)
 		if self.combo_calidad.lineEdit() is not None:
 			self.combo_calidad.lineEdit().setPlaceholderText(
 				"Seleccione o escriba una calidad"
@@ -917,7 +1225,7 @@ class CEDISEtiquetasApp(QMainWindow):
 		lista_layout.setContentsMargins(0, 0, 0, 0)
 		lista_layout.setSpacing(9)
 
-		lista_layout.addWidget(crear_etiqueta_campo("Modelo"))
+		lista_layout.addWidget(crear_etiqueta_campo("Modelo", "modelo.png"))
 
 		lista_entrada_layout = QHBoxLayout()
 		lista_entrada_layout.setContentsMargins(0, 0, 0, 0)
@@ -932,6 +1240,9 @@ class CEDISEtiquetasApp(QMainWindow):
 
 		self.btn_agregar_modelo_lista = QPushButton("Agregar")
 		self.btn_agregar_modelo_lista.setObjectName("btn_list_primary")
+		registrar_icono_boton(
+			self.btn_agregar_modelo_lista, "agregar.png", "primary", 18
+		)
 		self.btn_agregar_modelo_lista.setMinimumHeight(42)
 		self.btn_agregar_modelo_lista.setMinimumWidth(110)
 		self.btn_agregar_modelo_lista.setCursor(
@@ -966,22 +1277,31 @@ class CEDISEtiquetasApp(QMainWindow):
 		lista_botones_layout = QVBoxLayout()
 		lista_botones_layout.setSpacing(8)
 
-		self.btn_subir_modelo = QPushButton("↑ Subir")
+		self.btn_subir_modelo = QPushButton("Subir")
 		self.btn_subir_modelo.setObjectName("btn_list_secondary")
+		registrar_icono_boton(
+			self.btn_subir_modelo, "subir.png", "primary", 18
+		)
 		self.btn_subir_modelo.setMinimumHeight(38)
 		self.btn_subir_modelo.setCursor(Qt.CursorShape.PointingHandCursor)
 		self.btn_subir_modelo.clicked.connect(self.subir_modelo_lista)
 		lista_botones_layout.addWidget(self.btn_subir_modelo)
 
-		self.btn_bajar_modelo = QPushButton("↓ Bajar")
+		self.btn_bajar_modelo = QPushButton("Bajar")
 		self.btn_bajar_modelo.setObjectName("btn_list_secondary")
+		registrar_icono_boton(
+			self.btn_bajar_modelo, "bajar.png", "primary", 18
+		)
 		self.btn_bajar_modelo.setMinimumHeight(38)
 		self.btn_bajar_modelo.setCursor(Qt.CursorShape.PointingHandCursor)
 		self.btn_bajar_modelo.clicked.connect(self.bajar_modelo_lista)
 		lista_botones_layout.addWidget(self.btn_bajar_modelo)
 
-		self.btn_eliminar_modelo = QPushButton("🗑 Eliminar")
+		self.btn_eliminar_modelo = QPushButton("Eliminar")
 		self.btn_eliminar_modelo.setObjectName("btn_list_danger")
+		registrar_icono_boton(
+			self.btn_eliminar_modelo, "eliminar.png", "danger", 18
+		)
 		self.btn_eliminar_modelo.setMinimumHeight(38)
 		self.btn_eliminar_modelo.setCursor(Qt.CursorShape.PointingHandCursor)
 		self.btn_eliminar_modelo.clicked.connect(self.eliminar_modelo_lista)
@@ -1001,11 +1321,14 @@ class CEDISEtiquetasApp(QMainWindow):
 		acciones_layout.setContentsMargins(20, 16, 20, 16)
 		acciones_layout.setSpacing(10)
 
-		agregar_titulo_tarjeta(acciones_layout, "⚙  ACCIONES", 145)
+		agregar_titulo_tarjeta(
+			acciones_layout, "ACCIONES", 145, "engranaje.png"
+		)
 
 		# Imprimir es la acción principal y más utilizada.
-		self.btn_imprimir = QPushButton("🖨️  IMPRIMIR")
+		self.btn_imprimir = QPushButton("IMPRIMIR")
 		self.btn_imprimir.setObjectName("btn_print_primary")
+		registrar_icono_boton(self.btn_imprimir, "imprimir.png", "primary", 22)
 		self.btn_imprimir.setMinimumHeight(46)
 		self.btn_imprimir.setCursor(Qt.CursorShape.PointingHandCursor)
 		self.btn_imprimir.clicked.connect(self.imprimir_etiqueta)
@@ -1015,15 +1338,19 @@ class CEDISEtiquetasApp(QMainWindow):
 		acciones_secundarias_layout.setContentsMargins(0, 0, 0, 0)
 		acciones_secundarias_layout.setSpacing(8)
 
-		self.btn_guardar = QPushButton("💾  GUARDAR PDF")
+		self.btn_guardar = QPushButton("GUARDAR PDF")
 		self.btn_guardar.setObjectName("btn_success")
+		registrar_icono_boton(self.btn_guardar, "guardar.png", "theme", 20)
 		self.btn_guardar.setMinimumHeight(43)
 		self.btn_guardar.setCursor(Qt.CursorShape.PointingHandCursor)
 		self.btn_guardar.clicked.connect(self.guardar_pdf)
 		acciones_secundarias_layout.addWidget(self.btn_guardar, 1)
 
-		self.btn_config_impresora = QPushButton("⚙️  CONFIGURAR IMPRESORA")
+		self.btn_config_impresora = QPushButton("CONFIGURAR IMPRESORA")
 		self.btn_config_impresora.setObjectName("btn_config")
+		registrar_icono_boton(
+			self.btn_config_impresora, "engranaje.png", "theme", 20
+		)
 		self.btn_config_impresora.setMinimumHeight(43)
 		self.btn_config_impresora.setCursor(Qt.CursorShape.PointingHandCursor)
 		self.btn_config_impresora.clicked.connect(
@@ -1033,8 +1360,9 @@ class CEDISEtiquetasApp(QMainWindow):
 
 		acciones_layout.addLayout(acciones_secundarias_layout)
 
-		self.btn_limpiar = QPushButton("🧹  LIMPIAR")
+		self.btn_limpiar = QPushButton("LIMPIAR")
 		self.btn_limpiar.setObjectName("btn_clean_link")
+		registrar_icono_boton(self.btn_limpiar, "limpiar.png", "muted", 18)
 		self.btn_limpiar.setMinimumHeight(34)
 		self.btn_limpiar.setCursor(Qt.CursorShape.PointingHandCursor)
 		self.btn_limpiar.clicked.connect(self.limpiar_campos)
@@ -1069,8 +1397,9 @@ class CEDISEtiquetasApp(QMainWindow):
 
 		agregar_titulo_tarjeta(
 			preview_card_layout,
-			"👁️  VISTA PREVIA",
+			"VISTA PREVIA",
 			155,
+			"vista_previa.png",
 		)
 
 		self.preview_container = QFrame()
@@ -1115,32 +1444,65 @@ class CEDISEtiquetasApp(QMainWindow):
 		form_layout.addWidget(right_widget, 64)
 		main_layout.addWidget(form_container, 1)
 
+		actualizar_iconos_formulario()
 		self._actualizar_modo_etiqueta()
 		self.actualizar_vista_previa()
 	def _crear_completer(self, items, parent_widget):
-		model = QStringListModel(items)
+		"""Crea un autocompletado que encuentra coincidencias en cualquier posición."""
+		model = QStringListModel(items, parent_widget)
 		completer = QCompleter(model, parent_widget)
 		completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
 		completer.setFilterMode(Qt.MatchFlag.MatchContains)
 		completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+		completer.setMaxVisibleItems(10)
+		completer.setWrapAround(False)
 		return completer
 
-	def _mostrar_sugerencias_marca(self, texto):
-		completer = self.combo_marca.completer()
-		if not completer:
+	def _conectar_autocompletado_dinamico(self, combo):
+		"""Actualiza el popup de sugerencias después de cada carácter escrito."""
+		line_edit = combo.lineEdit()
+		if line_edit is None:
 			return
-		completer.setCompletionPrefix(texto)
-		completer.complete()
+
+		line_edit.textEdited.connect(
+			lambda texto, combo_objetivo=combo: self._mostrar_sugerencias_combo(
+				combo_objetivo, texto
+			)
+		)
+
+	def _mostrar_sugerencias_combo(self, combo, texto):
+		"""Filtra y muestra las coincidencias de Marca o Calidad en tiempo real."""
+		completer = combo.completer()
+		if completer is None:
+			return
+
+		texto_busqueda = texto.strip()
+		if not texto_busqueda:
+			completer.popup().hide()
+			return
+
+		completer.setCompletionPrefix(texto_busqueda)
+
+		# Mantiene el popup al menos tan ancho como el combo para que las
+		# sugerencias se lean completas mientras se sigue escribiendo.
+		rect = combo.rect()
+		ancho_popup = completer.popup().sizeHintForColumn(0)
+		ancho_scroll = completer.popup().verticalScrollBar().sizeHint().width()
+		rect.setWidth(max(combo.width(), ancho_popup + ancho_scroll + 18))
+		completer.complete(rect)
 
 	def obtener_tipo_etiqueta(self):
+		"""Obtiene tipo etiqueta y mantiene actualizado el estado relacionado."""
 		if hasattr(self, "combo_tipo_etiqueta"):
 			return self.combo_tipo_etiqueta.currentText().strip()
 		return self.LABEL_TYPE_OPTIONS[0]
 
 	def es_modo_lista_modelos(self):
+		"""Indica si modo lista modelos y mantiene actualizado el estado relacionado."""
 		return self.obtener_tipo_etiqueta() == "Lista de modelos"
 
 	def _obtener_modelos_lista(self):
+		"""Obtiene modelos lista y mantiene actualizado el estado relacionado."""
 		modelos = []
 		if not hasattr(self, "lista_modelos_widget"):
 			return modelos
@@ -1154,6 +1516,7 @@ class CEDISEtiquetasApp(QMainWindow):
 		return modelos
 
 	def _refrescar_lista_modelos_widget(self, modelos=None, selected_row=None):
+		"""Ejecuta la lógica asociada a refrescar lista modelos widget."""
 		if not hasattr(self, "lista_modelos_widget"):
 			return
 		if modelos is None:
@@ -1176,6 +1539,7 @@ class CEDISEtiquetasApp(QMainWindow):
 			self.lista_modelos_widget.setCurrentRow(selected_row)
 
 	def _actualizar_modo_etiqueta(self):
+		"""Actualiza modo etiqueta y mantiene actualizado el estado relacionado."""
 		es_lista_modelos = self.es_modo_lista_modelos()
 
 		if hasattr(self, "individual_widget"):
@@ -1192,10 +1556,12 @@ class CEDISEtiquetasApp(QMainWindow):
 				self.combo_marca.setCompleter(
 					self._crear_completer(self.BRAND_OPTIONS, self.combo_marca)
 				)
+				self._conectar_autocompletado_dinamico(self.combo_marca)
 			self.combo_marca.setEditText(marca_actual)
 
 		self.actualizar_vista_previa()
 	def agregar_modelo_lista(self):
+		"""Agrega modelo lista y mantiene actualizado el estado relacionado."""
 		if not hasattr(self, "entry_modelo_lista"):
 			return
 
@@ -1250,6 +1616,7 @@ class CEDISEtiquetasApp(QMainWindow):
 		self.actualizar_vista_previa()
 
 	def eliminar_modelo_lista(self):
+		"""Elimina modelo lista y mantiene actualizado el estado relacionado."""
 		if not hasattr(self, "lista_modelos_widget"):
 			return
 		row = self.lista_modelos_widget.currentRow()
@@ -1264,6 +1631,7 @@ class CEDISEtiquetasApp(QMainWindow):
 			self.actualizar_vista_previa()
 
 	def subir_modelo_lista(self):
+		"""Mueve hacia arriba modelo lista y mantiene actualizado el estado relacionado."""
 		if not hasattr(self, "lista_modelos_widget"):
 			return
 		row = self.lista_modelos_widget.currentRow()
@@ -1276,6 +1644,7 @@ class CEDISEtiquetasApp(QMainWindow):
 		self.actualizar_vista_previa()
 
 	def bajar_modelo_lista(self):
+		"""Mueve hacia abajo modelo lista y mantiene actualizado el estado relacionado."""
 		if not hasattr(self, "lista_modelos_widget"):
 			return
 		row = self.lista_modelos_widget.currentRow()
@@ -1288,6 +1657,7 @@ class CEDISEtiquetasApp(QMainWindow):
 		self.actualizar_vista_previa()
 
 	def _manejar_seleccion_radio(self, grupo, checked):
+		"""Gestiona seleccion radio."""
 		if not hasattr(self, "preview_label"):
 			return
 
@@ -1313,6 +1683,7 @@ class CEDISEtiquetasApp(QMainWindow):
 		self.actualizar_vista_previa()
 
 	def obtener_generacion(self):
+		"""Obtiene generacion y mantiene actualizado el estado relacionado."""
 		if hasattr(self, "radio_generacion_4g") and self.radio_generacion_4g.isChecked():
 			return "4G"
 		if hasattr(self, "radio_generacion_5g") and self.radio_generacion_5g.isChecked():
@@ -1320,6 +1691,7 @@ class CEDISEtiquetasApp(QMainWindow):
 		return ""
 
 	def obtener_marco(self):
+		"""Obtiene marco y mantiene actualizado el estado relacionado."""
 		if hasattr(self, "radio_marco_si") and self.radio_marco_si.isChecked():
 			return "C/M"
 		return ""
@@ -1412,11 +1784,18 @@ class CEDISEtiquetasApp(QMainWindow):
 		self.actualizar_iconos_footer()
 
 	def alternar_tema(self):
+		"""Alterna tema y mantiene actualizado el estado relacionado."""
 		self.tema_oscuro = not self.tema_oscuro
+		guardar_tema_global(
+			self.tema_oscuro,
+			getattr(self, "_ajustes_tema", None),
+		)
 		self.btn_tema.setText("☀️ Modo Claro" if self.tema_oscuro else "🌙 Modo Oscuro")
 		self.aplicar_estilos()
 		self.actualizar_header_logo()
 		self.actualizar_iconos_footer()
+		if hasattr(self, "_actualizar_iconos_formulario"):
+			self._actualizar_iconos_formulario()
 		self.actualizar_vista_previa()
 
 		if self.ayuda_dialog:
@@ -1461,6 +1840,7 @@ class CEDISEtiquetasApp(QMainWindow):
 				self.btn_info.setIcon(QIcon(pixmap_info))
 
 	def aplicar_estilos(self):
+		"""Aplica estilos y mantiene actualizado el estado relacionado."""
 		if self.tema_oscuro:
 			bg_main = "#121212"
 			bg_secondary = "#1E1E1E"
@@ -1474,6 +1854,10 @@ class CEDISEtiquetasApp(QMainWindow):
 			footer_button_bg = "#2A2A2A"
 			footer_button_border = "transparent"
 			footer_icon_color = "#FFFFFF"
+			footer_button_hover_bg = "#CD0403"
+			footer_button_hover_border = "#CD0403"
+			footer_button_hover_color = "#FFFFFF"
+			footer_button_pressed_bg = "#A30302"
 			text_primary = "#E0E0E0"
 			text_secondary = "#B0B0B0"
 			text_disabled = "#666666"
@@ -1503,6 +1887,10 @@ class CEDISEtiquetasApp(QMainWindow):
 			footer_button_bg = "#ECEFF2"
 			footer_button_border = "#D7DCE1"
 			footer_icon_color = "#2B2B2B"
+			footer_button_hover_bg = "#F2D2D2"
+			footer_button_hover_border = "#D98A8A"
+			footer_button_hover_color = "#2B2B2B"
+			footer_button_pressed_bg = "#E7BDBD"
 			text_primary = "#1A1A1A"
 			text_secondary = "#2C3E50"
 			text_disabled = "#9E9E9E"
@@ -1920,8 +2308,8 @@ class CEDISEtiquetasApp(QMainWindow):
 			}}
 
 			QListWidget#lista_modelos_widget::item:selected {{
-				background-color: #FEE2E2;
-				color: #CD0403;
+				background-color: {"#5A2929" if self.tema_oscuro else "#FEE2E2"};
+				color: {"#FFE1E1" if self.tema_oscuro else "#CD0403"};
 			}}
 
 			/* Mantiene contraste suficiente al pasar el mouse sobre una fila. */
@@ -1932,8 +2320,8 @@ class CEDISEtiquetasApp(QMainWindow):
 
 			/* Evita que el hover sobrescriba los colores de la selección. */
 			QListWidget#lista_modelos_widget::item:selected:hover {{
-				background-color: #FEE2E2;
-				color: #CD0403;
+				background-color: {"#663030" if self.tema_oscuro else "#FEE2E2"};
+				color: {"#FFFFFF" if self.tema_oscuro else "#CD0403"};
 			}}
 
 			QFrame#preview_container {{
@@ -2023,13 +2411,13 @@ class CEDISEtiquetasApp(QMainWindow):
 			}}
 
 			QPushButton#btn_theme_toggle:hover {{
-				background-color: #CD0403;
-				border: 1px solid #CD0403;
-				color: #FFFFFF;
+				background-color: {footer_button_hover_bg};
+				border: 1px solid {footer_button_hover_border};
+				color: {footer_button_hover_color};
 			}}
 
 			QPushButton#btn_theme_toggle:pressed {{
-				background-color: #A30302;
+				background-color: {footer_button_pressed_bg};
 			}}
 
 			QPushButton#btn_help {{
@@ -2040,11 +2428,12 @@ class CEDISEtiquetasApp(QMainWindow):
 			}}
 
 			QPushButton#btn_help:hover {{
-				background-color: #CD0403;
+				background-color: {footer_button_hover_bg};
+				border: 1px solid {footer_button_hover_border};
 			}}
 
 			QPushButton#btn_help:pressed {{
-				background-color: #A30302;
+				background-color: {footer_button_pressed_bg};
 			}}
 
 			QMessageBox {{
@@ -2394,29 +2783,36 @@ class CEDISEtiquetasApp(QMainWindow):
 			)
 
 	def obtener_marca(self):
+		"""Obtiene marca y mantiene actualizado el estado relacionado."""
 		return self.combo_marca.currentText().strip().upper()
 
 	def obtener_modelo(self):
+		"""Obtiene modelo y mantiene actualizado el estado relacionado."""
 		return self.entry_modelo.text().strip().upper()
 
 	def obtener_modelo_historial(self):
+		"""Obtiene modelo historial y mantiene actualizado el estado relacionado."""
 		if self.es_modo_lista_modelos():
 			return " ; ".join(self._obtener_modelos_lista())
 		return self.obtener_modelo()
 
 	def obtener_calidad(self):
+		"""Obtiene calidad y mantiene actualizado el estado relacionado."""
 		return self.combo_calidad.currentText().strip().upper()
 
 	def obtener_calidad_historial(self):
+		"""Obtiene calidad historial y mantiene actualizado el estado relacionado."""
 		if self.es_modo_lista_modelos():
 			return "LISTA DE MODELOS"
 		return self.obtener_calidad()
 
 	def obtener_calidad_etiqueta(self):
+		"""Obtiene calidad etiqueta y mantiene actualizado el estado relacionado."""
 		calidad = self.obtener_calidad()
 		return "" if calidad == "SIN CALIDAD" else calidad
 
 	def validar_datos(self):
+		"""Valida datos y mantiene actualizado el estado relacionado."""
 		marca = self.obtener_marca()
 		if self.es_modo_lista_modelos():
 			modelos = self._obtener_modelos_lista()
@@ -2443,6 +2839,7 @@ class CEDISEtiquetasApp(QMainWindow):
 		return True
 
 	def limpiar_campos(self):
+		"""Ejecuta la lógica asociada a limpiar campos."""
 		confirmado = KBKADialog.confirm(
 			self,
 			"Limpiar Campos",
@@ -2480,6 +2877,7 @@ class CEDISEtiquetasApp(QMainWindow):
 			self.combo_marca.setFocus()
 
 	def _font(self, font_name, size):
+		"""Ejecuta la lógica asociada a font."""
 		font_candidates = [font_name]
 		if os.name == "nt":
 			font_candidates.extend([
@@ -2495,6 +2893,7 @@ class CEDISEtiquetasApp(QMainWindow):
 		return ImageFont.load_default()
 
 	def _fit_single_line_font(self, draw, text, font_name, start_size, min_size, max_width):
+		"""Ejecuta la lógica asociada a fit single line font."""
 		for size in range(start_size, min_size - 1, -1):
 			font = self._font(font_name, size)
 			if self._measure(draw, text, font)[0] <= max_width:
@@ -2502,10 +2901,12 @@ class CEDISEtiquetasApp(QMainWindow):
 		return self._font(font_name, min_size)
 
 	def _measure(self, draw, text, font):
+		"""Ejecuta la lógica asociada a measure."""
 		bbox = draw.textbbox((0, 0), text, font=font)
 		return bbox[2] - bbox[0], bbox[3] - bbox[1]
 
 	def _wrap_text(self, draw, text, font, max_width):
+		"""Ejecuta la lógica asociada a wrap text."""
 		words = text.split()
 		if not words:
 			return [""]
@@ -2523,6 +2924,7 @@ class CEDISEtiquetasApp(QMainWindow):
 		return lines
 
 	def _wrap_text_fixed_size(self, draw, text, font, max_width):
+		"""Ejecuta la lógica asociada a wrap text fixed size."""
 		words = text.split()
 		if not words:
 			return [""]
@@ -2531,6 +2933,7 @@ class CEDISEtiquetasApp(QMainWindow):
 		current = ""
 
 		def split_long_token(token):
+			"""Ejecuta la lógica asociada a split long token."""
 			chunks = []
 			chunk = ""
 			for char in token:
@@ -2567,6 +2970,7 @@ class CEDISEtiquetasApp(QMainWindow):
 		return lines
 
 	def _fit_font_and_lines(self, draw, text, font_name, start_size, min_size, max_width):
+		"""Ejecuta la lógica asociada a fit font and lines."""
 		for size in range(start_size, min_size - 1, -1):
 			font = self._font(font_name, size)
 			lines = self._wrap_text(draw, text, font, max_width)
@@ -2576,12 +2980,15 @@ class CEDISEtiquetasApp(QMainWindow):
 		return font, self._wrap_text(draw, text, font, max_width)
 
 	def _mm_to_px(self, value_mm, dpi):
+		"""Ejecuta la lógica asociada a mm to px."""
 		return int((value_mm / 25.4) * dpi)
 
 	def _mm_to_cm(self, value_mm):
+		"""Ejecuta la lógica asociada a mm to cm."""
 		return value_mm / 10.0
 
 	def _generar_qr_imagen(self, payload, qr_target):
+		"""Ejecuta la lógica asociada a generar qr imagen."""
 		if qrcode is None:
 			return None
 		try:
@@ -2600,6 +3007,7 @@ class CEDISEtiquetasApp(QMainWindow):
 			return None
 
 	def _pegar_qr_en_etiqueta(self, img, base_size, payload):
+		"""Ejecuta la lógica asociada a pegar qr en etiqueta."""
 		qr_target = max(12, int(base_size * 0.10))
 		qr_img = self._generar_qr_imagen(payload, qr_target)
 		if qr_img is None:
@@ -2610,6 +3018,7 @@ class CEDISEtiquetasApp(QMainWindow):
 		img.paste(qr_img, (qr_x, qr_y))
 
 	def _dividir_modelos_en_columnas(self, modelos):
+		"""Ejecuta la lógica asociada a dividir modelos en columnas."""
 		if len(modelos) < 7:
 			return [modelos]
 		mitad = (len(modelos) + 1) // 2
@@ -2632,6 +3041,7 @@ class CEDISEtiquetasApp(QMainWindow):
 		return font, QFontMetrics(qt_font)
 
 	def _ajustar_fuente_lista_modelos(self, draw, modelos, usable_width, usable_height, escala):
+		"""Ejecuta la lógica asociada a ajustar fuente lista modelos."""
 		columnas = self._dividir_modelos_en_columnas(modelos)
 		column_gap = int(14 * escala) if len(columnas) > 1 else 0
 		line_gap = max(1, int(6 * escala))
@@ -2695,6 +3105,7 @@ class CEDISEtiquetasApp(QMainWindow):
 		return font, columnas, column_widths, column_gap, line_gap, line_height, block_width, block_height
 
 	def _generar_imagen_etiqueta_lista(self, escala=1.0):
+		"""Ejecuta la lógica asociada a generar imagen etiqueta lista."""
 		base_size = int(self.LABEL_SIZE_PX * escala)
 		img = Image.new("RGB", (base_size, base_size), "white")
 		draw = ImageDraw.Draw(img)
@@ -2766,6 +3177,7 @@ class CEDISEtiquetasApp(QMainWindow):
 		return img
 
 	def generar_imagen_etiqueta(self, escala=1.0):
+		"""Ejecuta la lógica asociada a generar imagen etiqueta."""
 		if self.es_modo_lista_modelos():
 			return self._generar_imagen_etiqueta_lista(escala)
 
@@ -2931,6 +3343,7 @@ class CEDISEtiquetasApp(QMainWindow):
 		return img
 
 	def eventFilter(self, objeto, evento):
+		"""Ejecuta la lógica asociada a eventFilter."""
 		if (
 			hasattr(self, "preview_container")
 			and objeto is self.preview_container
@@ -2940,6 +3353,7 @@ class CEDISEtiquetasApp(QMainWindow):
 		return super().eventFilter(objeto, evento)
 
 	def ajustar_vista_previa(self):
+		"""Ejecuta la lógica asociada a ajustar vista previa."""
 		if not hasattr(self, "preview_pixmap_original"):
 			return
 		if self.preview_pixmap_original.isNull():
@@ -2962,6 +3376,7 @@ class CEDISEtiquetasApp(QMainWindow):
 		self.preview_label.setText("")
 
 	def actualizar_vista_previa(self):
+		"""Actualiza vista previa y mantiene actualizado el estado relacionado."""
 		if not hasattr(self, "preview_label"):
 			return
 		try:
@@ -3030,23 +3445,25 @@ class CEDISEtiquetasApp(QMainWindow):
 			KBKADialog.error(self, "Error", f"Error al guardar el PDF:\n{str(e)}")
 
 	def imprimir_etiqueta(self):
+		"""Imprime la etiqueta de modelos mediante QtPrintSupport."""
 		if not self.validar_datos():
 			return
 
-		if not WIN32_AVAILABLE:
-			KBKADialog.warning(
-				self,
-				"Impresión No Disponible",
-				"La impresión directa requiere win32print.\n\nInstale pywin32 o use Guardar PDF.",
+		if not QT_PRINT_AVAILABLE:
+			detalle = (
+				"No fue posible cargar Qt PrintSupport.\n\n"
+				"Se generó un diagnóstico en:\n"
+				+ (
+					QT_PRINT_DIAGNOSTIC_PATH
+					or r"%APPDATA%\KBKA_Shop\diagnostico_impresion_modelos.txt"
+				)
 			)
+			KBKADialog.warning(self, "Impresión No Disponible", detalle)
 			return
 
 		nombre_impresora = self.cargar_impresora_config()
 		if not nombre_impresora:
-			try:
-				nombre_impresora = win32print.GetDefaultPrinter()
-			except Exception:
-				nombre_impresora = None
+			nombre_impresora = str(QPrinterInfo.defaultPrinterName() or "").strip()
 
 		if not nombre_impresora:
 			KBKADialog.warning(
@@ -3056,54 +3473,66 @@ class CEDISEtiquetasApp(QMainWindow):
 			)
 			return
 
+		painter = None
 		try:
 			img = self.generar_imagen_etiqueta(escala=self.PDF_SCALE)
 			if img.mode != "RGB":
 				img = img.convert("RGB")
+			qimage = pil_a_qimage(img)
 
-			hdc = win32ui.CreateDC()
-			hdc.CreatePrinterDC(nombre_impresora)
-
-			dpi_x = hdc.GetDeviceCaps(88)
-			dpi_y = hdc.GetDeviceCaps(90)
-
-			page_width_mm = self.LABEL_PAGE_MM
-			page_height_mm = self.LABEL_PAGE_MM
-			content_width_mm = self.LABEL_CONTENT_MM
-			content_height_mm = self.LABEL_CONTENT_MM
-			page_width_px = self._mm_to_px(page_width_mm, dpi_x)
-			page_height_px = self._mm_to_px(page_height_mm, dpi_y)
-			content_width_px = self._mm_to_px(content_width_mm, dpi_x)
-			content_height_px = self._mm_to_px(content_height_mm, dpi_y)
-			offset_x_px = self._mm_to_px(self.LABEL_LEFT_MM, dpi_x)
-			offset_y_px = self._mm_to_px(self.LABEL_BOTTOM_MM, dpi_y)
-
-			dib = ImageWin.Dib(img)
-
-			hdc.StartDoc("Etiquetas CEDIS")
-			hdc.StartPage()
-			dib.draw(
-				hdc.GetHandleOutput(),
-				(
-					offset_x_px,
-					offset_y_px,
-					offset_x_px + content_width_px,
-					offset_y_px + content_height_px,
-				),
+			printer = crear_impresora_qt(
+				nombre_impresora=nombre_impresora,
+				ancho_mm=self.LABEL_PAGE_MM,
+				alto_mm=self.LABEL_PAGE_MM,
+				nombre_formato=f"KBKA Modelos {self.LABEL_PAGE_MM}x{self.LABEL_PAGE_MM} mm",
 			)
-			hdc.EndPage()
-			hdc.EndDoc()
-			hdc.DeleteDC()
+
+			painter = QPainter()
+			if not painter.begin(printer):
+				raise RuntimeError(
+					"Qt no pudo iniciar el trabajo de impresión. "
+					"Revise el estado de la impresora y su controlador."
+				)
+
+			painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+			dpi = max(1, printer.resolution())
+			mm_a_px = lambda mm: int(round((float(mm) / 25.4) * dpi))
+			pagina = painter.viewport()
+			destino = QRect(
+				pagina.x() + mm_a_px(self.LABEL_LEFT_MM),
+				pagina.y() + mm_a_px(self.LABEL_BOTTOM_MM),
+				mm_a_px(self.LABEL_CONTENT_MM),
+				mm_a_px(self.LABEL_CONTENT_MM),
+			)
+			painter.drawImage(destino, qimage)
+			painter.end()
+			painter = None
 
 			self.registrar_historial("impreso", None)
-
 			KBKADialog.success(
 				self,
 				"Impresión Exitosa",
 				f"La etiqueta se envió correctamente a:\n{nombre_impresora}",
 			)
-		except Exception as e:
-			KBKADialog.error(self, "Error", f"Error al imprimir la etiqueta:\n{str(e)}")
+		except Exception:
+			import traceback
+
+			error = traceback.format_exc()
+			guardar_diagnostico_impresion("Impresión con QtPrintSupport", error)
+			KBKADialog.error(
+				self,
+				"Error al imprimir",
+				"No se pudo imprimir la etiqueta.\n\n"
+				+ (error.splitlines()[-1] if error else "Error desconocido")
+				+ "\n\nRevise el diagnóstico en:\n"
+				+ (
+					QT_PRINT_DIAGNOSTIC_PATH
+					or r"%APPDATA%\KBKA_Shop\diagnostico_impresion_modelos.txt"
+				),
+			)
+		finally:
+			if painter is not None and painter.isActive():
+				painter.end()
 
 
 class AyudaDialog(QDialog):
@@ -3121,6 +3550,7 @@ class AyudaDialog(QDialog):
 	"""
 
 	def __init__(self, parent=None):
+		"""Inicializa el objeto, crea su estado interno y prepara sus componentes visuales."""
 		super().__init__(parent)
 		self.parent_window = parent
 		self.setWindowTitle("Centro de Ayuda y Solución de Problemas")
@@ -3184,7 +3614,7 @@ class AyudaDialog(QDialog):
 		icon_label = QLabel()
 		icon_label.setStyleSheet("background: transparent; border: none;")
 		try:
-			ayuda_icon_path = obtener_ruta_recurso(os.path.join(ICONS_DIR, "ayuda_negra.png"))
+			ayuda_icon_path = obtener_ruta_recurso(os.path.join(ICONS_DIR, "ayuda.png"))
 			if os.path.exists(ayuda_icon_path):
 				icon_pixmap = QPixmap(ayuda_icon_path)
 				icon_pixmap = icon_pixmap.scaled(
@@ -3240,18 +3670,18 @@ class AyudaDialog(QDialog):
 		content_layout.setSpacing(15)
 
 		problema1_data = self.crear_problema_frame(
-			"🖨️ La etiqueta sale en blanco, cortada o con orientación incorrecta",
+			"La etiqueta sale en blanco, cortada o con orientación incorrecta",
 			"<b>Chequeos rápidos:</b><br><br>"
 			"<b>1) Campos:</b> Asegúrate de que <b>Marca</b>, <b>Modelo</b> y <b>Calidad</b> estén completos. <b>Modelo</b> es obligatorio.<br><br>"
 			"<b>2) Vista previa:</b> Revisa la vista previa en la aplicación; si se ve correctamente, pulsa <b>'GUARDAR PDF'</b> y abre el PDF para imprimir desde el visor.<br><br>"
-			"<b>3) Configurar impresora:</b> En <b>'⚙️ CONFIGURAR IMPRESORA'</b> selecciona tu impresora y confirma el tamaño de etiqueta (ej. <b>102x102 mm</b>) y que el diseño quede centrado con un margen mínimo. Guarda y vuelve a probar.<br><br>"
+			"<b>3) Configurar impresora:</b> En <b>'CONFIGURAR IMPRESORA'</b> selecciona tu impresora y confirma el tamaño de etiqueta (ej. <b>102x102 mm</b>) y que el diseño quede centrado con un margen mínimo. Guarda y vuelve a probar.<br><br>"
 			"<b>4) Reinicia y prueba:</b> Apaga y enciende la impresora, cierra y abre la app, y vuelve a intentar. Si sigue el problema, guarda el PDF y comparte la captura de la vista previa con Chava." 
 		)
 		self.problema_frames.append(problema1_data)
 		content_layout.addWidget(problema1_data["frame"])
 
 		problema2_data = self.crear_problema_frame(
-			"✏️ No se guardan o no aparecen Marca/Modelo/Calidad",
+			"No se guardan o no aparecen Marca/Modelo/Calidad",
 			"<b>1) Completa los campos:</b> Selecciona una <b>Marca</b>, escribe el <b>Modelo</b> y elige la <b>Calidad</b>. No dejes campos vacíos.<br><br>"
 			"<b>2) Guardar:</b> Usa <b>'GUARDAR PDF'</b> o <b>'IMPRIMIR'</b> para que la etiqueta y el historial se registren.<br><br>"
 			"<b>3) Historial:</b> Revisa el historial en la aplicación; si no aparece, cierra y vuelve a abrir la app y vuelve a intentarlo.<br><br>"
@@ -3261,9 +3691,9 @@ class AyudaDialog(QDialog):
 		content_layout.addWidget(problema2_data["frame"])
 
 		problema3_data = self.crear_problema_frame(
-			"🔴 No puedo imprimir desde la aplicación",
+			"No puedo imprimir desde la aplicación",
 			"<b>Qué hacer:</b><br><br>"
-			"<b>1) Selección en la app:</b> Ve a <b>'⚙️ CONFIGURAR IMPRESORA'</b> y elige la impresora correcta. Guarda y reinicia la app.<br><br>"
+			"<b>1) Selección en la app:</b> Ve a <b>'CONFIGURAR IMPRESORA'</b> y elige la impresora correcta. Guarda y reinicia la app.<br><br>"
 			"<b>2) Conexión:</b> Asegúrate de que la impresora esté encendida y conectada al equipo.",
 		)
 		self.problema_frames.append(problema3_data)
@@ -3420,26 +3850,17 @@ class AyudaDialog(QDialog):
 			print(f"Error al copiar email: {e}")
 
 	def crear_problema_frame(self, titulo, solucion):
-		"""
-		Crea una card premium para cada problema con su solución.
-
-		:param titulo: Título del problema.
-		:type titulo: str
-		:param solucion: Descripción de la solución (puede incluir HTML).
-		:type solucion: str
-		:return: Diccionario con referencias a los widgets de la card.
-		:rtype: dict
-		"""
+		"""Crea una card por problema con problema.png junto al título."""
 		frame = QFrame()
+		frame.setObjectName("problema_card")
 		frame.setStyleSheet(
 			"""
-			QFrame {
+			QFrame#problema_card {
 				background-color: white;
 				border: 1px solid #E8E8E8;
 				border-radius: 10px;
-				padding: 20px;
 			}
-			QFrame:hover {
+			QFrame#problema_card:hover {
 				border: 1px solid #CD0403;
 			}
 			"""
@@ -3447,26 +3868,49 @@ class AyudaDialog(QDialog):
 
 		layout = QVBoxLayout(frame)
 		layout.setSpacing(12)
-		layout.setContentsMargins(0, 0, 0, 0)
+		layout.setContentsMargins(20, 18, 20, 18)
+
+		titulo_fila = QHBoxLayout()
+		titulo_fila.setContentsMargins(0, 0, 0, 0)
+		titulo_fila.setSpacing(10)
+
+		icono_label = QLabel()
+		icono_label.setFixedSize(28, 28)
+		icono_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+		icono_label.setStyleSheet("background: transparent; border: none; padding: 0;")
+		icono = recolorear_icono_footer(
+			buscar_icono_asset("problema.png"),
+			self.parent_window.COLORS["primary"],
+			22,
+			22,
+		)
+		if not icono.isNull():
+			icono_label.setPixmap(icono)
+		titulo_fila.addWidget(icono_label, 0, Qt.AlignmentFlag.AlignTop)
 
 		titulo_label = QLabel(titulo)
 		titulo_label.setWordWrap(True)
 		titulo_label.setStyleSheet(
-			"""
-			color: #CD0403;
-			font-size: 12pt;
+			f"""
+			font-size: 13pt;
 			font-weight: bold;
+			color: {self.parent_window.COLORS['primary']};
 			font-family: 'Segoe UI', sans-serif;
 			background-color: transparent;
 			border: none;
 			padding: 0;
 			"""
 		)
-		layout.addWidget(titulo_label)
+		titulo_fila.addWidget(titulo_label, 1)
+		layout.addLayout(titulo_fila)
 
 		separador = QFrame()
+		separador.setObjectName("problema_separador")
 		separador.setFrameShape(QFrame.Shape.HLine)
-		separador.setStyleSheet("color: #E8E8E8;")
+		separador.setFixedHeight(1)
+		separador.setStyleSheet(
+			"QFrame#problema_separador { background-color: #F0F0F0; border: none; }"
+		)
 		layout.addWidget(separador)
 
 		solucion_label = QLabel(solucion)
@@ -3474,10 +3918,10 @@ class AyudaDialog(QDialog):
 		solucion_label.setTextFormat(Qt.TextFormat.RichText)
 		solucion_label.setStyleSheet(
 			"""
-			color: #2D2D2D;
 			font-size: 10pt;
+			color: #4A4A4A;
+			line-height: 1.7;
 			font-family: 'Segoe UI', sans-serif;
-			line-height: 1.5;
 			background-color: transparent;
 			border: none;
 			padding: 0;
@@ -3487,9 +3931,12 @@ class AyudaDialog(QDialog):
 
 		return {
 			"frame": frame,
+			"titulo": titulo_label,
+			"solucion": solucion_label,
 			"titulo_label": titulo_label,
-			"separador": separador,
 			"solucion_label": solucion_label,
+			"separador": separador,
+			"icono": icono_label,
 		}
 
 	def aplicar_estilos(self):
@@ -3570,13 +4017,12 @@ class AyudaDialog(QDialog):
 
 				frame.setStyleSheet(
 					f"""
-					QFrame {{
+					QFrame#problema_card {{
 						background-color: {bg_card};
 						border: 1px solid {border_color};
 						border-radius: 10px;
-						padding: 20px;
 					}}
-					QFrame:hover {{
+					QFrame#problema_card:hover {{
 						border: 1px solid {border_hover};
 						background-color: {bg_card_hover};
 					}}
@@ -3650,13 +4096,14 @@ class ConfiguracionImpresoraDialog(QDialog):
 	- Seleccionar impresora predeterminada
 	- Guardar la configuración automáticamente
 
-	Usa win32print para enumerar impresoras (requiere pywin32).
+	Usa QtPrintSupport para enumerar las impresoras del sistema.
 
 	:param parent: Ventana principal de la aplicación.
 	:type parent: CEDISEtiquetasApp
 	"""
 
 	def __init__(self, parent=None):
+		"""Inicializa el objeto, crea su estado interno y prepara sus componentes visuales."""
 		super().__init__(parent)
 		self.parent_window = parent
 		self.setWindowTitle("Configuración de Impresión")
@@ -3668,14 +4115,30 @@ class ConfiguracionImpresoraDialog(QDialog):
 
 	@property
 	def tema_oscuro(self):
+		"""Ejecuta la lógica asociada a tema oscuro."""
 		return self.parent_window.tema_oscuro if self.parent_window else False
 
 	def init_ui(self):
+		"""Ejecuta la lógica asociada a init ui."""
 		layout = QVBoxLayout(self)
 		layout.setContentsMargins(20, 20, 20, 20)
 		layout.setSpacing(15)
 
-		titulo = QLabel("⚙️ CONFIGURACIÓN DE IMPRESIÓN")
+		titulo_fila = QHBoxLayout()
+		titulo_fila.addStretch()
+
+		icono_titulo = QLabel()
+		ruta_engranaje = buscar_icono_asset("engranaje.png")
+		color_icono_titulo = "#FFFFFF" if self.tema_oscuro else "#111111"
+		pixmap_engranaje = recolorear_icono_footer(
+			ruta_engranaje, color_icono_titulo, 24, 24
+		)
+		icono_titulo.setPixmap(pixmap_engranaje)
+		icono_titulo.setFixedSize(28, 28)
+		icono_titulo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+		titulo_fila.addWidget(icono_titulo)
+
+		titulo = QLabel("CONFIGURACIÓN DE IMPRESIÓN")
 		titulo.setAlignment(Qt.AlignmentFlag.AlignCenter)
 		titulo.setStyleSheet(f"""
 			color: {self.parent_window.COLORS['primary']};
@@ -3683,7 +4146,9 @@ class ConfiguracionImpresoraDialog(QDialog):
 			font-weight: bold;
 			padding: 5px 0px;
 		""")
-		layout.addWidget(titulo)
+		titulo_fila.addWidget(titulo)
+		titulo_fila.addStretch()
+		layout.addLayout(titulo_fila)
 
 		layout.addSpacing(10)
 
@@ -3691,7 +4156,7 @@ class ConfiguracionImpresoraDialog(QDialog):
 		label_impresora.setStyleSheet("font-size: 11pt; font-weight: bold;")
 		layout.addWidget(label_impresora)
 
-		self.combo_impresoras = QComboBox()
+		self.combo_impresoras = ComboBoxSinRueda()
 		self.combo_impresoras.setPlaceholderText("Seleccione una impresora...")
 		self.combo_impresoras.setMinimumHeight(40)
 
@@ -3712,8 +4177,8 @@ class ConfiguracionImpresoraDialog(QDialog):
 				index = self.combo_impresoras.findText(impresora_guardada)
 				if index >= 0:
 					self.combo_impresoras.setCurrentIndex(index)
-		elif not WIN32_AVAILABLE:
-			self.combo_impresoras.addItem("win32print no disponible")
+		elif not QT_PRINT_AVAILABLE:
+			self.combo_impresoras.addItem("Qt PrintSupport no disponible")
 			self.combo_impresoras.setEnabled(False)
 		else:
 			self.combo_impresoras.addItem("No hay impresoras disponibles")
@@ -3762,11 +4227,38 @@ class ConfiguracionImpresoraDialog(QDialog):
 
 		layout.addSpacing(15)
 
-		info_label = QLabel("💡 La impresora seleccionada se guardará automáticamente.")
+		# Mensaje informativo con icono
+		info_contenedor = QWidget()
+		info_contenedor.setObjectName("transparent_widget")
+		info_fila = QHBoxLayout(info_contenedor)
+		info_fila.setContentsMargins(0, 0, 0, 0)
+		info_fila.setSpacing(7)
+
+		icono_foco = QLabel()
+		ruta_foco = buscar_icono_asset("foco.png")
+		color_foco = "#E0E0E0" if self.tema_oscuro else "#343A40"
+		pixmap_foco = recolorear_icono_footer(
+			ruta_foco, color_foco, 17, 17
+		)
+		icono_foco.setPixmap(pixmap_foco)
+		icono_foco.setFixedSize(22, 22)
+		icono_foco.setAlignment(Qt.AlignmentFlag.AlignCenter)
+		icono_foco.setStyleSheet(
+			"background: transparent; border: none;"
+		)
+		info_fila.addWidget(icono_foco)
+
+		info_label = QLabel(
+			"La impresora seleccionada se guardará automáticamente."
+		)
 		info_color = "#E0E0E0" if self.tema_oscuro else "#666666"
-		info_label.setStyleSheet(f"color: {info_color}; font-size: 9pt; font-style: italic;")
+		info_label.setStyleSheet(
+			f"color: {info_color}; font-size: 9pt; font-style: italic; "
+			"background: transparent; border: none;"
+		)
 		info_label.setWordWrap(True)
-		layout.addWidget(info_label)
+		info_fila.addWidget(info_label, 1)
+		layout.addWidget(info_contenedor)
 
 		layout.addStretch()
 
@@ -3795,7 +4287,8 @@ class ConfiguracionImpresoraDialog(QDialog):
 		layout.addWidget(btn_cerrar)
 
 	def on_impresora_changed(self, nombre_impresora):
-		if nombre_impresora and nombre_impresora not in ["No hay impresoras disponibles", "win32print no disponible"]:
+		"""Ejecuta la lógica asociada a on impresora changed."""
+		if nombre_impresora and nombre_impresora not in ["No hay impresoras disponibles", "Qt PrintSupport no disponible"]:
 			try:
 				self.parent_window.guardar_impresora_config(nombre_impresora)
 			except Exception as e:
@@ -3818,26 +4311,17 @@ class ConfiguracionImpresoraDialog(QDialog):
 			print(f"Error al copiar email: {e}")
 
 	def crear_problema_frame(self, titulo, solucion):
-		"""
-		Crea una card premium para cada problema con su solución.
-
-		:param titulo: Título del problema.
-		:type titulo: str
-		:param solucion: Descripción de la solución (puede incluir HTML).
-		:type solucion: str
-		:return: Diccionario con referencias a los widgets de la card.
-		:rtype: dict
-		"""
+		"""Crea una card por problema con problema.png junto al título."""
 		frame = QFrame()
+		frame.setObjectName("problema_card")
 		frame.setStyleSheet(
 			"""
-			QFrame {
+			QFrame#problema_card {
 				background-color: white;
 				border: 1px solid #E8E8E8;
 				border-radius: 10px;
-				padding: 20px;
 			}
-			QFrame:hover {
+			QFrame#problema_card:hover {
 				border: 1px solid #CD0403;
 			}
 			"""
@@ -3845,22 +4329,49 @@ class ConfiguracionImpresoraDialog(QDialog):
 
 		layout = QVBoxLayout(frame)
 		layout.setSpacing(12)
+		layout.setContentsMargins(20, 18, 20, 18)
+
+		titulo_fila = QHBoxLayout()
+		titulo_fila.setContentsMargins(0, 0, 0, 0)
+		titulo_fila.setSpacing(10)
+
+		icono_label = QLabel()
+		icono_label.setFixedSize(28, 28)
+		icono_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+		icono_label.setStyleSheet("background: transparent; border: none; padding: 0;")
+		icono = recolorear_icono_footer(
+			buscar_icono_asset("problema.png"),
+			self.parent_window.COLORS["primary"],
+			22,
+			22,
+		)
+		if not icono.isNull():
+			icono_label.setPixmap(icono)
+		titulo_fila.addWidget(icono_label, 0, Qt.AlignmentFlag.AlignTop)
 
 		titulo_label = QLabel(titulo)
+		titulo_label.setWordWrap(True)
 		titulo_label.setStyleSheet(
 			f"""
 			font-size: 13pt;
 			font-weight: bold;
 			color: {self.parent_window.COLORS['primary']};
 			font-family: 'Segoe UI', sans-serif;
-			padding-bottom: 3px;
+			background-color: transparent;
+			border: none;
+			padding: 0;
 			"""
 		)
-		layout.addWidget(titulo_label)
+		titulo_fila.addWidget(titulo_label, 1)
+		layout.addLayout(titulo_fila)
 
 		separador = QFrame()
-		separador.setFixedHeight(2)
-		separador.setStyleSheet("background-color: #F0F0F0; border: none;")
+		separador.setObjectName("problema_separador")
+		separador.setFrameShape(QFrame.Shape.HLine)
+		separador.setFixedHeight(1)
+		separador.setStyleSheet(
+			"QFrame#problema_separador { background-color: #F0F0F0; border: none; }"
+		)
 		layout.addWidget(separador)
 
 		solucion_label = QLabel(solucion)
@@ -3872,6 +4383,9 @@ class ConfiguracionImpresoraDialog(QDialog):
 			color: #4A4A4A;
 			line-height: 1.7;
 			font-family: 'Segoe UI', sans-serif;
+			background-color: transparent;
+			border: none;
+			padding: 0;
 			"""
 		)
 		layout.addWidget(solucion_label)
@@ -3880,7 +4394,10 @@ class ConfiguracionImpresoraDialog(QDialog):
 			"frame": frame,
 			"titulo": titulo_label,
 			"solucion": solucion_label,
+			"titulo_label": titulo_label,
+			"solucion_label": solucion_label,
 			"separador": separador,
+			"icono": icono_label,
 		}
 
 	def aplicar_estilos(self):
@@ -4035,6 +4552,7 @@ class ModernSplashScreen(QWidget):
 	Pantalla de inicio ultra-premium para KBKA SHOP (copiada desde main.py).
 	"""
 	def __init__(self):
+		"""Inicializa el objeto, crea su estado interno y prepara sus componentes visuales."""
 		super().__init__()
 		self.main_window = None
 		self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint)
@@ -4051,12 +4569,14 @@ class ModernSplashScreen(QWidget):
 		self._setup_animations()
 
 	def _center_on_screen(self):
+		"""Ejecuta la lógica asociada a center on screen."""
 		screen = QApplication.primaryScreen().geometry()
 		x = (screen.width() - self.width()) // 2
 		y = (screen.height() - self.height()) // 2
 		self.move(x, y)
 
 	def _setup_ui(self):
+		"""Ejecuta la lógica asociada a setup ui."""
 		main_layout = QVBoxLayout(self)
 		main_layout.setContentsMargins(20, 20, 20, 20)
 		self.container = QFrame()
@@ -4125,6 +4645,7 @@ class ModernSplashScreen(QWidget):
 		main_layout.addWidget(self.container)
 
 	def _setup_animations(self):
+		"""Ejecuta la lógica asociada a setup animations."""
 		self.splash_opacity_effect = QGraphicsOpacityEffect(self)
 		self.setGraphicsEffect(self.splash_opacity_effect)
 		self.splash_opacity_effect.setOpacity(0.0)
@@ -4145,9 +4666,11 @@ class ModernSplashScreen(QWidget):
 		self.progress_animation.finished.connect(self._on_progress_finished)
 
 	def _on_progress_finished(self):
+		"""Ejecuta la lógica asociada a on progress finished."""
 		QTimer.singleShot(1000, self._close_and_show_main)
 
 	def show(self):
+		"""Ejecuta la lógica asociada a show."""
 		super().show()
 		self.fade_in_animation.start()
 		if hasattr(self, 'original_pixmap'):
@@ -4155,6 +4678,7 @@ class ModernSplashScreen(QWidget):
 		self.progress_animation.start()
 
 	def _animate_logo_scale(self):
+		"""Ejecuta la lógica asociada a animate logo scale."""
 		if not hasattr(self, 'original_pixmap'):
 			return
 		steps = 6
@@ -4162,6 +4686,7 @@ class ModernSplashScreen(QWidget):
 		step_time = duration // steps
 
 		def update_scale(step):
+			"""Actualiza la escala de la vista previa de acuerdo con el tamaño disponible."""
 			if step > steps:
 				return
 			scale = 0.98 + (0.02 * step / steps)
@@ -4174,12 +4699,14 @@ class ModernSplashScreen(QWidget):
 
 	def _close_and_show_main(self):
 		# Crear la ventana principal aquí para asegurar inicialización completa
+		"""Ejecuta la lógica asociada a close and show main."""
 		self.main_window = CEDISEtiquetasApp()
 		self.main_window.show()
 		self.close()
 
 
 def main():
+	"""Inicia QApplication, crea la ventana principal y ejecuta el ciclo de eventos de Qt."""
 	app = QApplication(sys.argv)
 	splash = ModernSplashScreen()
 	splash.show()

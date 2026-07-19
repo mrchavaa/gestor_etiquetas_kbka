@@ -1,0 +1,9 @@
+# Dependencias de KBKA SHOP - Gestor de Etiquetas v2.1.1
+# Compatible con Python 3.11 de 64 bits.
+
+PyQt6>=6.7,<7
+Pillow>=10.4,<13
+pandas>=2.2,<3
+reportlab>=4.2,<5
+qrcode[pil]>=7.4,<9
+cx-Freeze>=7.2,<9
